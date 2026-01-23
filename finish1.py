@@ -1,5 +1,5 @@
 '''
-K230 云台红色物体跟踪 - 精简版
+K230 云台红色物体跟踪 - 完整版(含前后距离识别)
 '''
 
 import time
@@ -48,6 +48,10 @@ PAN_DEADZONE = 800    # 水平死区 (增大以减少抖动)
 PAN_MIN_SPEED = 500  # 最小转动速度
 PAN_MIN_SPEED_OUTSIDE = 1500  # 最小转动速度 (离开安全区时使用,更快响应)
 
+# 前后距离识别参数
+DISTANCE_REFERENCE_PIXELS = 5000  # 参考像素数(标准距离)
+DISTANCE_DEADZONE = 500  # 距离死区(像素数)
+
 # ========== 转换函数 ==========
 def tilt_angle_to_ns(angle):
     """垂直角度转脉宽"""
@@ -60,6 +64,22 @@ def pan_speed_to_ns(speed):
     speed = max(PAN_SPEED_MIN, min(PAN_SPEED_MAX, speed))
     ns = SERVO_MID_NS + (speed * 50)
     return max(SERVO_MIN_NS, min(SERVO_MAX_NS, ns))
+
+def analyze_distance(pixels):
+    """
+    分析物体前后距离
+    :param pixels: 物体像素数
+    :return: distance_state ('FORWARD', 'MIDDLE', 'BACKWARD')
+    :return: distance_value: 距离差值(像素数)
+    """
+    diff = pixels - DISTANCE_REFERENCE_PIXELS
+    
+    if abs(diff) < DISTANCE_DEADZONE:
+        return 'MIDDLE', diff  # 接近标准距离
+    elif diff > 0:
+        return 'FORWARD', diff  # 物体越来越近
+    else:
+        return 'BACKWARD', diff  # 物体越来越远
 
 # ========== 初始化 ==========
 def init_servos():
@@ -103,6 +123,7 @@ def init_camera():
 def main():
     print("=" * 40)
     print("K230 云台红色物体跟踪")
+    print("含前后距离识别功能")
     print("=" * 40)
     
     # 初始化硬件
@@ -139,10 +160,14 @@ def main():
                     # 找到目标
                     blob = max(blobs, key=lambda b: b.pixels())
                     x, y = blob.cx(), blob.cy()
+                    pixels = blob.pixels()  # 物体像素数
                     
                     # 计算原始误差(像素)
                     delta_x = x - CX
                     delta_y = y - CY
+                    
+                    # 分析前后距离
+                    distance_state, distance_value = analyze_distance(pixels)
                     
                     # 检查物体是否在安全区内
                     in_safe_area = (SAFE_AREA_X_MIN <= x <= SAFE_AREA_X_MAX and 
@@ -205,6 +230,20 @@ def main():
                             img.draw_line(x1, y1, x2, y2, color=(255,100,0), thickness=1)
                     
                     lost_target_frames = 0
+                    
+                    # 显示前后距离信息
+                    if distance_state == 'FORWARD':
+                        distance_display = "物体靠近"
+                        distance_color = (0,255,0)  # 绿色
+                    elif distance_state == 'BACKWARD':
+                        distance_display = "物体远离"
+                        distance_color = (255,0,0)  # 红色
+                    else:
+                        distance_display = "距离适中"
+                        distance_color = (0,255,255)  # 黄色
+                    
+                    img.draw_string_advanced(20, 100, 24, distance_display, color=distance_color)
+                    img.draw_string_advanced(20, 130, 20, f"像素: {pixels}", color=(200,200,200))
                     
                 else:
                     # 未找到目标

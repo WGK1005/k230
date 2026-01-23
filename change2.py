@@ -517,10 +517,6 @@ def main():
 
             # 10. 显示到屏幕和IDE
             Display.show_image(img)
-            
-            # 每隔N帧才传输到IDE（减少IDE传输压力）
-            if frame_count % IDE_DISPLAY_INTERVAL == 0:
-                Display.show_image(img, to_ide=True)
 
             # 11. 控制帧率
             frame_time = time.ticks_diff(time.ticks_ms(), frame_start)
