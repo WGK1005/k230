@@ -12,8 +12,8 @@ from machine import PWM, FPIOA
 W, H = 800, 480  # 屏幕尺寸
 CX, CY = W // 2, H // 2  # 中心点
 
-# 安全区设置(面积占屏幕3/5)
-SAFE_AREA_RATIO = 0.7746  # sqrt(3/5)
+# 安全区设置(面积占屏幕1/20)
+SAFE_AREA_RATIO = 0.2236  # sqrt(1/20)
 SAFE_AREA_W = int(W * SAFE_AREA_RATIO)  # 安全区宽度
 SAFE_AREA_H = int(H * SAFE_AREA_RATIO)  # 安全区高度
 SAFE_AREA_X_MIN = (W - SAFE_AREA_W) // 2
