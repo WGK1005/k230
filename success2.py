@@ -12,14 +12,7 @@ from machine import PWM, FPIOA
 W, H = 800, 480  # 屏幕尺寸
 CX, CY = W // 2, H // 2  # 中心点
 
-# 安全区设置(面积占屏幕3/5)
-SAFE_AREA_RATIO = 0.7746  # sqrt(3/5)
-SAFE_AREA_W = int(W * SAFE_AREA_RATIO)  # 安全区宽度
-SAFE_AREA_H = int(H * SAFE_AREA_RATIO)  # 安全区高度
-SAFE_AREA_X_MIN = (W - SAFE_AREA_W) // 2
-SAFE_AREA_X_MAX = SAFE_AREA_X_MIN + SAFE_AREA_W
-SAFE_AREA_Y_MIN = (H - SAFE_AREA_H) // 2
-SAFE_AREA_Y_MAX = SAFE_AREA_Y_MIN + SAFE_AREA_H
+# 安全区功能已禁用 - 实时追踪模式
 
 # 舵机脉宽(纳秒)
 SERVO_MIN_NS = 1000000   # 1.0ms
@@ -41,12 +34,10 @@ MIN_PIXELS = 200
 LOST_TARGET_DELAY = 90  # 3秒延迟(30fps)
 
 # 控制系数
-PAN_COEF = 0.5    # 水平比例系数 (在安全区内使用)
-PAN_COEF_OUTSIDE = 1.5  # 水平比例系数 (离开安全区时使用,更快响应)
+PAN_COEF = 1.0    # 水平比例系数
 TILT_COEF = 15    # 垂直比例系数
-PAN_DEADZONE = 800    # 水平死区 (增大以减少抖动)
-PAN_MIN_SPEED = 500  # 最小转动速度
-PAN_MIN_SPEED_OUTSIDE = 1500  # 最小转动速度 (离开安全区时使用,更快响应)
+PAN_DEADZONE = 100    # 水平死区
+PAN_MIN_SPEED = 200  # 最小转动速度
 
 # ========== 转换函数 ==========
 def tilt_angle_to_ns(angle):
@@ -58,7 +49,7 @@ def tilt_angle_to_ns(angle):
 def pan_speed_to_ns(speed):
     """水平速度转脉宽"""
     speed = max(PAN_SPEED_MIN, min(PAN_SPEED_MAX, speed))
-    ns = SERVO_MID_NS + (speed * 50)
+    ns = SERVO_MID_NS + int(speed * 50)
     return max(SERVO_MIN_NS, min(SERVO_MAX_NS, ns))
 
 # ========== 初始化 ==========
@@ -144,33 +135,18 @@ def main():
                     delta_x = x - CX
                     delta_y = y - CY
                     
-                    # 检查物体是否在安全区内
-                    in_safe_area = (SAFE_AREA_X_MIN <= x <= SAFE_AREA_X_MAX and 
-                                   SAFE_AREA_Y_MIN <= y <= SAFE_AREA_Y_MAX)
-                    
-                    # 水平控制:只有在安全区外才追踪
-                    if in_safe_area:
-                        # 在安全区内,水平舵机停止转动
+                    # 水平控制:实时追踪
+                    if abs(delta_x) < PAN_DEADZONE:
                         pan_speed = 0
                     else:
-                        # 在安全区外,执行追踪(使用更高的速度)
-                        # 物体在中央十字左侧(delta_x < 0) -> 云台向左(-速度)
-                        # 物体在中央十字右侧(delta_x > 0) -> 云台向右(+速度)
+                        # 计算速度(反向计算:左偏差->左转,右偏差->右转)
+                        pan_speed_simple = (-delta_x * PAN_COEF)
+                        pan_speed_simple = max(PAN_SPEED_MIN, min(PAN_SPEED_MAX, pan_speed_simple))
                         
-                        # 死区检查:如果偏差较小,停止转动
-                        if abs(delta_x) < PAN_DEADZONE // 100:
-                            pan_speed = 0
+                        if pan_speed_simple > 0:
+                            pan_speed = max(pan_speed_simple, PAN_MIN_SPEED)
                         else:
-                            # 计算速度(离开安全区时使用更高系数,反向计算)
-                            pan_speed_simple = (-delta_x * PAN_COEF_OUTSIDE)
-                            pan_speed_simple = max(PAN_SPEED_MIN, min(PAN_SPEED_MAX, pan_speed_simple))
-                            
-                            if pan_speed_simple > 0:
-                                # 右侧偏差:云台向右转
-                                pan_speed = max(pan_speed_simple, PAN_MIN_SPEED_OUTSIDE)
-                            else:
-                                # 左侧偏差:云台向左转
-                                pan_speed = min(pan_speed_simple, -PAN_MIN_SPEED_OUTSIDE)
+                            pan_speed = min(pan_speed_simple, -PAN_MIN_SPEED)
                     
                     # 垂直控制:比例控制
                     tilt_offset = (-delta_y * TILT_COEF)
@@ -187,11 +163,6 @@ def main():
                     img.draw_rectangle(blob.rect(), color=(255,0,0), thickness=2)
                     img.draw_cross(x, y, color=(255,0,0), size=10, thickness=2)
                     img.draw_line(x, y, CX, CY, color=(255,150,0), thickness=1)
-                    
-                    # 绘制安全区
-                    safe_area_color = (0,255,0) if in_safe_area else (255,100,0)
-                    img.draw_rectangle((SAFE_AREA_X_MIN, SAFE_AREA_Y_MIN, SAFE_AREA_W, SAFE_AREA_H), 
-                                     color=safe_area_color, thickness=2)
                     
                     # 记录轨迹
                     target_history.append((x, y))
