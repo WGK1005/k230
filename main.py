@@ -1,147 +1,246 @@
+import gc
+import socket
 import time
+
+import network
 from media.sensor import *
 from media.display import *
 from media.media import *
-from machine import PWM, FPIOA
 
-# ========== 基本参数 ==========
-W, H = 800, 480
+
+# ===================== 最简配置 =====================
+WIFI_SSID = "嵌入式实验室406"
+WIFI_PASSWORD = "qrssys406"
+
+W, H = 320, 240
 CX, CY = W // 2, H // 2
 
-# 舵机参数
-SERVO_MIN_NS = 1000000
-SERVO_MID_NS = 1500000
-SERVO_MAX_NS = 2000000
-
-# 垂直舵机角度范围(*100)
-TILT_MIN, TILT_MAX, TILT_INIT = 4500, 13500, 9000
-
-# 红色阈值
 RED_TH = (20, 80, 30, 100, 0, 60)
+MIN_PIXELS = 200
+HTTP_PORT = 8080
+SHOW_LCD = False
 
-# ===== 稳定性控制参数 =====
-DEADZONE = 10          # 死区(像素) - 在此范围内不动
-SMOOTH = 0.4          # 平滑系数(0~1, 越小越稳)
-PAN_SCALE = 9.0        # 水平灵敏度
-TILT_SCALE = 12.5       # 垂直灵敏度
-MIN_MOVE = 75         # 最小移动量
 
-# 距离参数
-DIST_REF = 5000        # 参考像素数
+def ensure_wifi():
+    wlan = network.WLAN(network.STA_IF)
+    if not wlan.active():
+        wlan.active(True)
 
-# ========== 全局状态 ==========
-tilt_angle = TILT_INIT
-smooth_x, smooth_y = 0.0, 0.0
-pixel_avg = DIST_REF
+    if wlan.isconnected():
+        return wlan.ifconfig()[0]
 
-def angle_to_ns(angle):
-    angle = max(TILT_MIN, min(TILT_MAX, angle))
-    return SERVO_MIN_NS + (angle * 1000000) // 18000
+    try:
+        wlan.connect(WIFI_SSID, WIFI_PASSWORD)
+    except Exception as err:
+        print("Wi-Fi 连接失败:", err)
 
-def speed_to_ns(speed):
-    speed = max(-10000, min(10000, speed))
-    return SERVO_MID_NS + speed * 50
+    for _ in range(60):
+        if wlan.isconnected():
+            return wlan.ifconfig()[0]
+        time.sleep(1)
 
-def init_hw():
-    # 舵机
-    FPIOA().set_function(46, FPIOA.PWM2)
-    FPIOA().set_function(47, FPIOA.PWM3)
-    ud = PWM(2, freq=50)
-    lr = PWM(3, freq=50)
-    ud.duty_ns(angle_to_ns(TILT_INIT))
-    lr.duty_ns(SERVO_MID_NS)
+    return "0.0.0.0"
 
-    # 摄像头
-    s = Sensor(width=W, height=H)
-    s.reset()
-    s.set_framesize(width=W, height=H)
-    s.set_pixformat(Sensor.RGB565)
-    Display.init(Display.ST7701, width=W, height=H, to_ide=True)
+
+def init_camera():
+    sensor = Sensor(width=W, height=H)
+    sensor.reset()
+    sensor.set_hmirror(True)
+    sensor.set_vflip(True)
+    sensor.set_framesize(width=W, height=H)
+    sensor.set_pixformat(Sensor.RGB565)
+
+    if SHOW_LCD:
+        Display.init(Display.ST7701, width=W, height=H)
+
     MediaManager.init()
-    s.run()
+    time.sleep_ms(300)
 
-    time.sleep(0.5)
-    return lr, ud, s
+    last_err = None
+    for _ in range(3):
+        try:
+            sensor.run()
+            return sensor
+        except Exception as err:
+            last_err = err
+            print("sensor.run 重试:", err)
+            time.sleep_ms(300)
+
+    raise last_err
+
+    return sensor
+
+
+def draw_ui(img, blob, fps, found):
+    if found and blob is not None:
+        x, y, w, h = blob.rect()
+        img.draw_rectangle(x, y, w, h, color=(255, 0, 0), thickness=2)
+
+
+def send_html(cl, ip):
+    page = (
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: text/html; charset=utf-8\r\n"
+        "Cache-Control: no-cache\r\n"
+        "Connection: close\r\n\r\n"
+        "<!doctype html><html><head><meta charset='utf-8'>"
+        "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+        "<title>K230 Red Stream</title>"
+        "<style>body{margin:0;background:#111;color:#eee;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh}"
+        ".box{text-align:center}img{max-width:100vw;max-height:100vh;border:1px solid #333;background:#000}</style>"
+        "</head><body><div class='box'>"
+        "<div>浏览器打开：</div>"
+        f"<div>http://{ip}:{HTTP_PORT}/stream</div>"
+        "<img src='/stream' alt='stream'>"
+        "</div></body></html>"
+    )
+    cl.send(page)
+
+
+def send_stream_header(cl):
+    cl.send(
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: multipart/x-mixed-replace; boundary=frame\r\n"
+        "Cache-Control: no-cache\r\n"
+        "Connection: close\r\n\r\n"
+    )
+
 
 def main():
-    global tilt_angle, smooth_x, smooth_y, pixel_avg
+    print("=" * 40)
+    print("K230 红色物体最简版本")
+    print("=" * 40)
 
-    print("实时追踪模式启动")
-    lr, ud, cam = init_hw()
+    ip = ensure_wifi()
+    print("K230 IP:", ip)
+
+    sensor = init_camera()
+
+    addr = socket.getaddrinfo("0.0.0.0", HTTP_PORT)[0][-1]
+    server = socket.socket()
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind(addr)
+    server.listen(1)
+    try:
+        server.settimeout(1)
+    except Exception:
+        pass
+
+    print("浏览器打开: http://{}:{}/".format(ip, HTTP_PORT))
+    print("或者直接打开: http://{}:{}/stream".format(ip, HTTP_PORT))
+
+    frame_count = 0
+    last_fps_time = time.ticks_ms()
+    fps = 0
 
     try:
         while True:
-            img = cam.snapshot()
+            try:
+                cl, client_addr = server.accept()
+            except Exception:
+                time.sleep_ms(10)
+                continue
 
-            blobs = img.find_blobs([RED_TH], pixels_threshold=200, merge=True)
+            print("客户端连接:", client_addr)
 
-            if blobs:
-                b = max(blobs, key=lambda x: x.pixels())
-                x, y, px = b.cx(), b.cy(), b.pixels()
+            try:
+                try:
+                    cl.settimeout(1)
+                except Exception:
+                    pass
 
-                # 原始误差
-                raw_x = x - CX
-                raw_y = y - CY
+                request = b""
+                for _ in range(20):
+                    try:
+                        request = cl.recv(1024)
+                        if request:
+                            break
+                    except Exception:
+                        pass
+                    time.sleep_ms(10)
 
-                # 低通滤波平滑
-                smooth_x = smooth_x * (1 - SMOOTH) + raw_x * SMOOTH
-                smooth_y = smooth_y * (1 - SMOOTH) + raw_y * SMOOTH
+                first_line = request.split(b"\r\n", 1)[0] if request else b""
 
-                # 像素数平滑(距离)
-                pixel_avg = pixel_avg * 0.9 + px * 0.1
+                if b"GET /stream" in first_line:
+                    send_stream_header(cl)
 
-                # === 水平控制 ===
-                if abs(smooth_x) > DEADZONE:
-                    spd = -smooth_x * PAN_SCALE
-                    if spd > 0:
-                        spd = max(spd, MIN_MOVE)
-                    else:
-                        spd = min(spd, -MIN_MOVE)
-                    lr.duty_ns(speed_to_ns(int(spd)))
+                    while True:
+                        frame_start = time.ticks_ms()
+
+                        img = sensor.snapshot()
+                        blobs = img.find_blobs([RED_TH], pixels_threshold=MIN_PIXELS, merge=True)
+
+                        found = False
+                        blob = None
+                        if blobs:
+                            blob = max(blobs, key=lambda x: x.pixels())
+                            found = True
+
+                        draw_ui(img, blob, fps, found)
+
+                        if SHOW_LCD:
+                            try:
+                                Display.show_image(img)
+                            except Exception:
+                                pass
+
+                        jpg = img.compress(quality=35)
+                        cl.send("--frame\r\n")
+                        cl.send("Content-Type: image/jpeg\r\n\r\n")
+                        cl.send(jpg)
+                        cl.send("\r\n")
+
+                        frame_count += 1
+                        if frame_count % 20 == 0:
+                            now = time.ticks_ms()
+                            elapsed = time.ticks_diff(now, last_fps_time)
+                            fps = 20000 // max(1, elapsed)
+                            last_fps_time = now
+
+                        if frame_count % 10 == 0:
+                            gc.collect()
+
+                        frame_cost = time.ticks_diff(time.ticks_ms(), frame_start)
+                        if frame_cost < 15:
+                            time.sleep_ms(15 - frame_cost)
+
                 else:
-                    lr.duty_ns(SERVO_MID_NS)
+                    send_html(cl, ip)
 
-                # === 垂直控制 ===
-                if abs(smooth_y) > DEADZONE:
-                    tilt_angle -= smooth_y * TILT_SCALE * SMOOTH
-                    tilt_angle = max(TILT_MIN, min(TILT_MAX, tilt_angle))
-                ud.duty_ns(angle_to_ns(int(tilt_angle)))
-
-                # 绘制
-                img.draw_rectangle(b.rect(), color=(255,0,0), thickness=2)
-                img.draw_cross(x, y, color=(255,0,0), size=10)
-                img.draw_line(x, y, CX, CY, color=(255,200,0))
-
-                # 距离显示
-                dist_ratio = int(pixel_avg / DIST_REF * 100)
-                if dist_ratio > 120:
-                    dt, dc = "近", (0,255,0)
-                elif dist_ratio < 80:
-                    dt, dc = "远", (255,100,100)
-                else:
-                    dt, dc = "中", (255,255,0)
-
-                img.draw_string_advanced(20, 80, 28, f"距离:{dt} {dist_ratio}%", color=dc)
-                img.draw_string_advanced(20, 40, 32, "锁定中", color=(0,255,255))
-
-            else:
-                lr.duty_ns(SERVO_MID_NS)
-                smooth_x, smooth_y = 0, 0
-                img.draw_string_advanced(20, 40, 32, "搜索中", color=(255,150,150))
-
-            # 中心准星
-            img.draw_cross(CX, CY, color=(0,255,0), size=25, thickness=3)
-            img.draw_circle(CX, CY, 40, color=(0,255,0), thickness=2)
-
-            Display.show_image(img)
-            time.sleep_ms(30)
+            except Exception as e:
+                print("客户端断开:", e)
+            finally:
+                try:
+                    cl.close()
+                except Exception:
+                    pass
 
     except KeyboardInterrupt:
-        pass
+        print("用户中断")
     finally:
-        lr.duty_ns(SERVO_MID_NS)
-        ud.duty_ns(angle_to_ns(TILT_INIT))
+        try:
+            server.close()
+        except Exception:
+            pass
+
+        try:
+            sensor.stop()
+        except Exception:
+            pass
+
+        if SHOW_LCD:
+            try:
+                Display.deinit()
+            except Exception:
+                pass
+
+        try:
+            MediaManager.deinit()
+        except Exception:
+            pass
+
         print("停止")
+
 
 if __name__ == "__main__":
     main()
