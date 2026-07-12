@@ -10,8 +10,8 @@ import time
 import network
 import time
 
-SSID = "实验"
-PASSWORD = "15235105794"
+SSID = "X30021027"
+PASSWORD = "12345678"
 
 print("[WIFI] 连接中...")
 wlan = network.WLAN(network.STA_IF)

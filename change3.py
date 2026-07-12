@@ -496,6 +496,7 @@ while True:
             gaussian_blur_size
         )
 
+
         # 4. 查找最小矩形
         min_area = 0x7FFFFFFF  # 最大整数
         smallest_rect = None
