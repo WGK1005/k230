@@ -6,13 +6,9 @@ from media.sensor import *
 from media.display import *
 from media.media import *
 
-
 # --------------------------- 硬件初始化 ---------------------------
 # 串口初始化
 # --------------------------- 串口初始化 ---------------------------
-
-
-
 
 # 屏幕分辨率设置
 lcd_width = 800
@@ -47,12 +43,13 @@ MAX_ASPECT_RATIO = 3.0        # 最大宽高比
 # 虚拟坐标与圆形参数
 BASE_RADIUS = 45              # 基础半径（虚拟坐标单位）
 POINTS_PER_CIRCLE = 50        # 圆形采样点数量
+
+# 🎯 提示：由于我们加入了 ROI 锁定，您可以把这个阈值稍微调宽，不惧怕背景干扰
 PURPLE_THRESHOLD = (20, 60, 15, 70, -70, -20)  # 紫色色块阈值
 
 # 基础矩形参数（固定方向，不再自动切换）
 RECT_WIDTH = 250    # 固定矩形宽度
 RECT_HEIGHT = 200    # 固定矩形高度
-# 移除自动切换方向的逻辑，始终使用固定宽高的虚拟矩形
 
 # --------------------------- 工具函数 ---------------------------
 def calculate_distance(p1, p2):
@@ -90,14 +87,38 @@ def is_valid_rect(corners):
 
     return valid_ratio and valid_area and valid_aspect
 
-def detect_purple_blobs(img):
-    return img.find_blobs(
+
+# 🎯 核心优化1：增加 ROI 参数，限制色块检测在靶盘范围内，同时融合碎色块
+def detect_purple_blobs(img, roi=None):
+    roi_safe = (0, 0, img.width(), img.height())
+    if roi:
+        # 如果检测到了靶盘，只在靶盘外框并向外扩展 15 像素的范围内检测
+        rx, ry, rw, rh = roi
+        margin = 15
+        x = max(0, rx - margin)
+        y = max(0, ry - margin)
+        w = min(img.width() - x, rw + 2 * margin)
+        h = min(img.height() - y, rh + 2 * margin)
+        roi_safe = (x, y, w, h)
+
+    blobs = img.find_blobs(
         [PURPLE_THRESHOLD],
-        pixels_threshold=100,
-        area_threshold=100,
-        merge=True
+        roi=roi_safe,          # 🎯 限制搜索区域，彻底隔绝背景杂物
+        pixels_threshold=80,
+        area_threshold=80,
+        merge=True,
+        margin=12              # 🎯 融合间距设为12，自动将断裂的红弧融合成一个整体色块
     )
 
+    # 🎯 核心优化2：仅保留面积最大的一个真实靶心，并做基础的长宽比过滤
+    if blobs:
+        largest_blob = max(blobs, key=lambda b: b.pixels())
+        bw, bh = largest_blob[2], largest_blob[3]
+        ratio = bw / max(bh, 0.1)
+        if 0.4 < ratio < 2.5:  # 过滤过于狭长（如水平一条线）的噪点
+            return [largest_blob]
+
+    return []
 
 
 def get_perspective_matrix(src_pts, dst_pts):
@@ -205,13 +226,7 @@ while True:
                   color=(0, 0, 255),
                   thickness=2)
 
-    # 1. 检测紫色色块（保留原有功能）
-    purple_blobs = detect_purple_blobs(img)
-    for blob in purple_blobs:
-        img.draw_rectangle(blob[0:4], color=(255, 0, 255), thickness=1)
-        img.draw_cross(blob.cx(), blob.cy(), color=(255, 0, 255), thickness=1)
-
-    # 2. 矩形检测（使用cv_lite替换原有实现）
+    # 🎯 核心优化3：调整顺序。优先进行矩形检测，用于提供精准的靶盘 ROI
     # 2.1 将RGB图像转为灰度图（用于矩形检测）
     gray_img = img.to_grayscale()
     img_np = gray_img.to_numpy_ref()  # 转为numpy数组供cv_lite使用
@@ -227,10 +242,8 @@ while True:
         max_angle_cos,     # 角度余弦阈值
         gaussian_blur_size # 高斯模糊尺寸
     )
-    #print("rects =", rects)
-    #print("num =", len(rects) if rects else 0)
 
-    # 3. 筛选最小矩形（保留原有逻辑）
+    # 筛选最小矩形
     min_area = float('inf')
     smallest_rect = None
     smallest_rect_corners = None  # 存储最小矩形的角点
@@ -238,7 +251,6 @@ while True:
     for rect in rects:
         # rect格式: [x, y, w, h, c1.x, c1.y, c2.x, c2.y, c3.x, c3.y, c4.x, c4.y]
         x, y, w, h = rect[0], rect[1], rect[2], rect[3]
-        # 提取四个角点
         corners = [
             (rect[4], rect[5]),   # 角点1
             (rect[6], rect[7]),   # 角点2
@@ -248,15 +260,19 @@ while True:
 
         # 验证矩形有效性
         if is_valid_rect(corners):
-            # 计算面积
-            area = w * h  # 直接使用矩形宽高计算面积（更高效）
-            # 更新最小矩形
+            area = w * h  # 直接使用矩形宽高计算面积
             if area < min_area:
                 min_area = area
                 smallest_rect = (x, y, w, h)
                 smallest_rect_corners = corners
 
-    # 4. 处理最小矩形（修改后：固定虚拟矩形方向）
+    # 🎯 核心优化4：利用检测到的靶盘 ROI 限制色块范围，保证放宽阈值也不会发生背景误检
+    purple_blobs = detect_purple_blobs(img, roi=smallest_rect)
+    for blob in purple_blobs:
+        img.draw_rectangle(blob[0:4], color=(255, 0, 255), thickness=1)
+        img.draw_cross(blob.cx(), blob.cy(), color=(255, 0, 255), thickness=1)
+
+    # 3. 处理最小矩形（固定虚拟矩形方向）
     if smallest_rect and smallest_rect_corners:
         x, y, w, h = smallest_rect
         corners = smallest_rect_corners
@@ -277,11 +293,7 @@ while True:
         rect_center_int = (int(round(rect_center[0])), int(round(rect_center[1])))
         img.draw_circle(rect_center_int[0], rect_center_int[1], 4, color=(0, 255, 255), thickness=2)
 
-        # 计算矩形主方向角（仅用于参考，不再影响虚拟矩形方向）
-        angle = get_rectangle_orientation(sorted_corners)
-
-        # 【核心修改】移除自动切换方向逻辑，固定使用预设的虚拟矩形尺寸和方向
-        # 固定虚拟矩形（不再根据实际宽高比切换）
+        # 固定使用预设的虚拟矩形尺寸和方向
         virtual_rect = [
             (0, 0),
             (RECT_WIDTH, 0),
@@ -289,11 +301,8 @@ while True:
             (0, RECT_HEIGHT)
         ]
 
-        # 【核心修改】固定圆形半径参数（不再根据实际宽高比调整）
         radius_x = BASE_RADIUS
         radius_y = BASE_RADIUS
-
-        # 【核心修改】固定虚拟中心（基于固定的宽高）
         virtual_center = (RECT_WIDTH / 2, RECT_HEIGHT / 2)
 
         # 在虚拟矩形中生成椭圆点集（映射后为正圆）
@@ -319,10 +328,6 @@ while True:
             if mapped_center:
                 cx, cy = map(int, map(round, mapped_center[0]))
                 img.draw_circle(cx, cy, 3, color=(0, 0, 255), thickness=1)
-                # 发送圆心坐标
-                #send_rect_center(cx, cy)
-            #发送圆形代码
-            #send_circle_points(int_points)
 
     # 5. 显示与性能统计
     fps = clock.fps()
@@ -332,5 +337,3 @@ while True:
     Display.show_image(img,
                       x=round((lcd_width-sensor.width())/2),
                       y=round((lcd_height-sensor.height())/2))
-
-    #print(f"FPS: {fps:.1f}")  # 打印FPS

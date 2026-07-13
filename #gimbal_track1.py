@@ -1,141 +1,116 @@
+# gimbal_track_with_ti.py (K230 上位机端)
 import time, os, sys
 import math
-import cv_lite  # 导入cv_lite扩展模块
-import ulab.numpy as np  # 导入numpy库
+import struct
+import cv_lite  
+import ulab.numpy as np  
 from media.sensor import *
 from media.display import *
 from media.media import *
 from machine import UART, FPIOA
 
-# --------------------------- 1. 硬件与屏幕初始化 ---------------------------
-lcd_width = 800
-lcd_height = 480
-CX = lcd_width // 2
-CY = lcd_height // 2
-
-# --------------------------- 2. 串口与引脚初始化 ---------------------------
+# --------------------------- 1. 串口与引脚底层映射 ---------------------------
 fpioa = FPIOA()
 
-# UART1（垂直/俯仰轴）
+# UART1（云台总线，一驱二：同时控制 0x01 垂直轴 & 0x02 水平轴）
 fpioa.set_function(3, FPIOA.UART1_TXD)
 fpioa.set_function(4, FPIOA.UART1_RXD)
 
-# UART2（水平/偏航轴）
-fpioa.set_function(5, FPIOA.UART2_TXD)
-fpioa.set_function(6, FPIOA.UART2_RXD)
+# UART2（下位机通信：发送偏差与指令给 TI 运动控制板）
+fpioa.set_function(11, FPIOA.UART2_TXD)
+fpioa.set_function(12, FPIOA.UART2_RXD)
 
-uart_ud = UART(UART.UART1, baudrate=115200)
-uart_lr = UART(UART.UART2, baudrate=115200)
+# 实例化串口
+uart_gimbal = UART(UART.UART1, baudrate=115200) # 云台电机
+uart_ti = UART(UART.UART2, baudrate=115200)     # TI板底盘
 
 VERTICAL_ADDR = 0x01
 HORIZONTAL_ADDR = 0x02
 
-# --------------------------- 3. 视觉配置参数 ---------------------------
-canny_thresh1      = 50        # Canny边缘检测低阈值
-canny_thresh2      = 150       # Canny边缘检测高阈值
-approx_epsilon     = 0.04      # 多边形拟合精度
-area_min_ratio     = 0.005     # 最小面积比例
-max_angle_cos      = 0.3       # 角度余弦阈值
-gaussian_blur_size = 3         # 高斯模糊核尺寸（奇数）
+# 运动方向极性配置
+PAN_DIR  = -1                  
+TILT_DIR = 1                   
 
-MIN_AREA = 100               # 最小面积阈值
-MAX_AREA = 300000             # 最大面积阈值
-MIN_ASPECT_RATIO = 0.3        # 最小宽高比
-MAX_ASPECT_RATIO = 3.0        # 最大宽高比
+# --------------------------- 2. 视觉算法常量 ---------------------------
+canny_thresh1      = 30        
+canny_thresh2      = 90        
+approx_epsilon     = 0.04      
+area_min_ratio     = 0.002     
+max_angle_cos      = 0.55      
+gaussian_blur_size = 3  
 
-BASE_RADIUS = 45              # 基础半径
-POINTS_PER_CIRCLE = 50        # 圆形采样点数量
-PURPLE_THRESHOLD = (20, 60, 15, 70, -70, -20)  # 紫色色块阈值
+MIN_AREA = 100               
+MAX_AREA = 300000             
+MIN_ASPECT_RATIO = 0.3        
+MAX_ASPECT_RATIO = 3.0        
 
-RECT_WIDTH = 250              # 固定矩形宽度
-RECT_HEIGHT = 200             # 固定矩形高度
+BASE_RADIUS = 45              
+POINTS_PER_CIRCLE = 50        
+RECT_WIDTH = 250              
+RECT_HEIGHT = 200             
 
-# --------------------------- 4. 电机硬限位与安全保护 ---------------------------
-PAN_LIMIT_MIN = -3500         # 水平偏航左侧安全极限（负脉冲数）
-PAN_LIMIT_MAX = 3500          # 水平偏航右侧安全极限（正脉冲数）
+# --------------------------- 3. 电机硬限位与安全保护 ---------------------------
+PAN_LIMIT_MIN = -3500         
+PAN_LIMIT_MAX = 3500          
+TILT_LIMIT_MIN = 0            
+TILT_LIMIT_MAX = 1600         
+PULSE_PER_REV = 3200          
+INIT_TILT = PULSE_PER_REV // 4 
 
-TILT_LIMIT_MIN = 0            # 垂直俯仰下侧极限
-TILT_LIMIT_MAX = 1600         # 垂直俯仰上侧极限（一圈为 3200 脉冲，1600 为半圈180度）
-PULSE_PER_REV = 3200          # 细分脉冲数
+# --------------------------- 4. 速位结合控制算法参数 ---------------------------
+DEADZONE_X = 12               
+DEADZONE_Y = 8                
 
-INIT_TILT = PULSE_PER_REV // 4 # 初始化垂直目标点（工作高度约 90 度，800 脉冲）
+SMOOTH_X = 0.30               
+SMOOTH_Y = 0.35
 
-# --------------------------- 5. 速位结合控制算法调参 ---------------------------
-DEADZONE_X = 15               # 水平追踪像素死区
-DEADZONE_Y = 8                # 垂直追踪像素死区
+KP_PAN   = 0.20               
+KD_PAN   = 0.12               
 
-SMOOTH_X = 0.05               # 像素坐标一阶滤波系数
-SMOOTH_Y = 0.10
+KP_TILT  = 0.45
+KD_TILT  = 0.15
 
-# 位置环 (PD 控制器) - 决定每次位置更新量 Delta P
-KP_PAN   = 0.40
-KD_PAN   = 0.20
+V_MIN_PAN  = 100
+V_MAX_PAN  = 800
+KV_PAN     = 1.8
 
-KP_TILT  = 0.55
-KD_TILT  = 0.18
+V_MIN_TILT = 100
+V_MAX_TILT = 800
+KV_TILT    = 1.8
 
-# 速度环 (动态限速) - 在直通限速位置模式下，限制运动过程的最大速度
-KV_PAN     = 1.5              # 水平速度随像素误差的增长系数
-V_MIN_PAN  = 120              # 最低追踪限速
-V_MAX_PAN  = 800              # 最高速度上限
+PAN_CONTROL_PERIOD = 40       
+TILT_CONTROL_PERIOD = 40      
 
-KV_TILT    = 2.2
-V_MIN_TILT = 120
-V_MAX_TILT = 900
+# --------------------------- 5. 电机与下位机通讯函数 ---------------------------
+def send_motor_cmd(cmd):
+    uart_gimbal.write(bytes(cmd))
 
-# 控制刷新周期
-PAN_CONTROL_PERIOD = 80       # 水平控制周期 (ms)
-TILT_CONTROL_PERIOD = 40      # 垂直控制周期 (ms)
-
-# --------------------------- 6. 控制全局状态变量 ---------------------------
-smooth_x = 0.0
-smooth_y = 0.0
-
-last_smooth_x = 0.0
-last_smooth_y = 0.0
-
-last_pan_control = 0
-last_tilt_control = 0
-
-pan_target = 0
-tilt_target = 0
-
-last_sent_speed_lr = 350      # 缓存最后下发给偏航轴的限速
-last_sent_speed_ud = 350      # 缓存最后下发给俯仰轴的限速
-
-# --------------------------- 7. 电机串口协议底层 ---------------------------
-def send(uart, cmd):
-    uart.write(bytes(cmd))
-   # time.sleep_ms(5)
-    #if uart.any():
-        #print("RX:", uart.read().hex())
-
-def fast_mode_init(uart, addr, speed=350, acc=5):
+def fast_mode_init(addr, speed=350, acc=5):
     cmd = [
         addr,
         0xF1,
         (speed >> 8) & 0xff,
         speed & 0xff,
         acc,
-        0x01,  # 多机同步标志
-        0x00,  # 是否保存
+        0x01,  
+        0x00,  
         0x6B
     ]
-    send(uart, cmd)
+    send_motor_cmd(cmd)
 
-def set_speed_lr(speed):
-    global last_sent_speed_lr
-    if abs(speed - last_sent_speed_lr) >= 20:
-        fast_mode_init(uart_lr, HORIZONTAL_ADDR, speed)
-        last_sent_speed_lr = speed
+def set_speed_ud(speed, last_speed):
+    if abs(speed - last_speed) >= 20:
+        fast_mode_init(VERTICAL_ADDR, speed)
+        return speed
+    return last_speed
 
-def set_speed_ud(speed):
-    global last_sent_speed_ud
-    if abs(speed - last_sent_speed_ud) >= 20:
-        fast_mode_init(uart_ud, VERTICAL_ADDR, speed)
-        last_sent_speed_ud = speed
+def set_speed_lr(speed, last_speed):
+    if abs(speed - last_speed) >= 20:
+        fast_mode_init(HORIZONTAL_ADDR, speed)
+        return speed
+    return last_speed
 
-def move_motor(uart, addr, target):
+def move_motor(addr, target):
     if target < 0:
         target = (1 << 32) + target
     cmd = [
@@ -147,9 +122,27 @@ def move_motor(uart, addr, target):
         target & 0xff,
         0x6B
     ]
-    send(uart, cmd)
+    send_motor_cmd(cmd)
 
-# --------------------------- 8. 视觉处理辅助函数 ---------------------------
+# 🎯 核心优化：发送给 TI 下位机的数据打包函数（含帧头、校验和、帧尾）
+def send_to_ti(target_type_id, dx, dy, pan, tilt):
+    """
+    target_type_id: 0-无目标, 1-矩形靶盘, 2-红色色块靶心
+    dx, dy: 目标中心相对于相机的像素偏差
+    pan, tilt: 当前云台电机的目标脉冲位置（用于TI判断相对角度）
+    """
+    # 格式：0x55 0xAA (帧头) + 1字节类型 + 4个16位有符号整型(dx, dy, pan, tilt) -> 共11字节
+    header = bytes([0x55, 0xAA])
+    payload = struct.pack('<Bhhhh', target_type_id, int(dx), int(dy), int(pan), int(tilt))
+    
+    # 简单加和校验（防EMI电磁干扰导致小车乱跑）
+    checksum = sum(payload) & 0xFF
+    
+    # 最终打包发送
+    packet = header + payload + bytes([checksum, 0x0D, 0x0A])
+    uart_ti.write(packet)
+
+# --------------------------- 6. 全局辅助数学与拟合函数 ---------------------------
 def calculate_distance(p1, p2):
     return math.sqrt((p2[0] - p1[0])**2 + (p2[1] - p1[1])**2)
 
@@ -180,14 +173,6 @@ def is_valid_rect(corners):
     valid_aspect = MIN_ASPECT_RATIO < aspect_ratio < MAX_ASPECT_RATIO
 
     return valid_ratio and valid_area and valid_aspect
-
-def detect_purple_blobs(img):
-    return img.find_blobs(
-        [PURPLE_THRESHOLD],
-        pixels_threshold=100,
-        area_threshold=100,
-        merge=True
-    )
 
 def get_perspective_matrix(src_pts, dst_pts):
     A = []
@@ -248,73 +233,119 @@ def sort_corners(corners):
         sorted_corners = sorted_corners[index:] + sorted_corners[:index]
     return sorted_corners
 
-# --------------------------- 9. 电机运动方向极性配置 ---------------------------
-PAN_DIR  = -1                  # 水平偏航方向极性（若相反请改为 -1）
-TILT_DIR = 1                  # 垂直俯仰方向极性（若相反请改为 -1）
+def detect_purple_blobs(img, threshold, roi=None):
+    roi_safe = (0, 0, img.width(), img.height())
+    if roi:
+        rx, ry, rw, rh = roi
+        margin = 15
+        x = max(0, rx - margin)
+        y = max(0, ry - margin)
+        w = min(img.width() - x, rw + 2 * margin)
+        h = min(img.height() - y, rh + 2 * margin)
+        roi_safe = (x, y, w, h)
 
-# 定义全局传感器对象
-sensor = None
+    blobs = img.find_blobs(
+        [threshold],
+        roi=roi_safe,
+        pixels_threshold=80,
+        area_threshold=80,
+        merge=True,
+        margin=12
+    )
+    
+    if blobs:
+        largest_blob = max(blobs, key=lambda b: b.pixels())
+        bw, bh = largest_blob[2], largest_blob[3]
+        ratio = bw / max(bh, 0.1)
+        if 0.4 < ratio < 2.5:
+            return [largest_blob]
+    return []
 
-# --------------------------- 10. 主控制逻辑 ---------------------------
-def main():
-    global sensor
-    global smooth_x, smooth_y, last_smooth_x, last_smooth_y
-    global pan_target, tilt_target
-    global last_pan_control, last_tilt_control
+# --------------------------- 7. 模块化追踪入口主函数 ---------------------------
+def run_gimbal_tracking(sensor, tp, key_esc, thresholds, width=800, height=480):
+    
+    fpioa = FPIOA()
+    fpioa.set_function(3, FPIOA.UART1_TXD) 
+    fpioa.set_function(4, FPIOA.UART1_RXD)
+    fpioa.set_function(5, FPIOA.UART2_TXD) 
+    fpioa.set_function(6, FPIOA.UART2_RXD)
 
-    # 采用标准 try-except-finally 架构防止程序二次运行爆内存和崩溃重启
+    print("正在等待触摸释放...")
+    while True:
+        points = tp.read(1)
+        if not points:
+            break
+        time.sleep_ms(20)
+
+    lcd_width = width
+    lcd_height = height
+    CX = lcd_width // 2
+    CY = lcd_height // 2
+
+    PURPLE_THRESHOLD = tuple(thresholds[0])
+    print("加载实时 LAB 追踪阈值:", PURPLE_THRESHOLD)
+
+    # --------------------------- 8. 初始化状态变量 ---------------------------
+    smooth_x = 0.0
+    smooth_y = 0.0
+    last_smooth_x = 0.0
+    last_smooth_y = 0.0
+
+    last_pan_control = 0
+    last_tilt_control = 0
+
+    pan_target = 0
+    tilt_target = 0
+
+    last_sent_speed_ud = 350      
+    last_sent_speed_lr = 350      
+
+    # ------------------ 9. 云台通电归零与就位 ------------------
+    print("正在加载绝对位置驱动配置...")
+    
+    fast_mode_init(HORIZONTAL_ADDR, 350) 
+    fast_mode_init(VERTICAL_ADDR, 350)
+    time.sleep_ms(200)
+
+    print("云台双轴归零...")
+    move_motor(VERTICAL_ADDR, 0)
+    move_motor(HORIZONTAL_ADDR, 0)
+    time.sleep(1.5)
+
+    print("俯仰抬升到初始工作高度...")
+    tilt_target = INIT_TILT
+    move_motor(VERTICAL_ADDR, tilt_target)
+    time.sleep(1.5)
+    print("安全校准完成，视觉闭环就绪...")
+
+    clock = time.clock()
+    
+    first_img = sensor.snapshot(chn=CAM_CHN_ID_0)
+    image_shape = [first_img.height(), first_img.width()]
+    print(f"当前输入图像解析分辨率: {image_shape[1]}x{image_shape[0]}")
+
+    # --------------------------- 10. 闭环控制核心循环 ---------------------------
     try:
-        # 使用无参构造，规避部分底层版本不匹配位置参数的问题
-        sensor = Sensor()
-        sensor.reset()
-        # 显式调整输出尺寸和格式
-        sensor.set_framesize(width=lcd_width, height=lcd_height)
-        sensor.set_pixformat(Sensor.RGB565)
-
-        # 初始化屏幕和多媒体层
-        Display.init(Display.ST7701, width=lcd_width, height=lcd_height, to_ide=True)
-        MediaManager.init()
-        sensor.run()
-
-        print("Zhang Datou Dual X42S Tracking System Start")
-
-        # ------------------ 云台通电归零初始化 ------------------
-        print("正在加载绝对位置驱动配置...")
-        fast_mode_init(uart_ud, VERTICAL_ADDR, 350)
-        fast_mode_init(uart_lr, HORIZONTAL_ADDR, 350)
-        time.sleep(0.5)
-
-        # 俯仰回归零点
-        tilt_target = 0
-        move_motor(uart_ud, VERTICAL_ADDR, tilt_target)
-        time.sleep(2)
-
-        # 俯仰抬升到初始工作角
-        tilt_target = INIT_TILT
-        move_motor(uart_ud, VERTICAL_ADDR, tilt_target)
-        time.sleep(2)
-        print("安全校准完成，视觉线程就绪...")
-
-        clock = time.clock()
-        image_shape = [sensor.height(), sensor.width()]  # [480, 800]
-
         while True:
-            # 捕获 IDE 的停止信号，允许程序干净利落地关闭硬件资源
             os.exitpoint()
             clock.tick()
-            img = sensor.snapshot()
+            
+            img = sensor.snapshot(chn=CAM_CHN_ID_0)
+
+            if key_esc.is_pressed():
+                print("收到退出信号，云台复位返回...")
+                time.sleep_ms(100)
+                move_motor(HORIZONTAL_ADDR, 0)
+                move_motor(VERTICAL_ADDR, INIT_TILT)
+                time.sleep_ms(200)
+                return
 
             target_x = None
             target_y = None
-            target_type = "None"
+            target_type_id = 0 # 0-无目标, 1-矩形, 2-色块
+            target_type_str = "None"
 
-            # (1) 紫色色块检测
-            purple_blobs = detect_purple_blobs(img)
-            for blob in purple_blobs:
-                img.draw_rectangle(blob[0:4], color=(255, 0, 255), thickness=1)
-                img.draw_cross(blob.cx(), blob.cy(), color=(255, 0, 255), thickness=1)
-
-            # (2) 使用 cv_lite 引擎进行矩形检测
+            # 优先矩形检测
             gray_img = img.to_grayscale()
             img_np = gray_img.to_numpy_ref()
 
@@ -342,13 +373,18 @@ def main():
                         smallest_rect = (x_r, y_r, w_r, h_r)
                         smallest_rect_corners = corners
 
-            # (3) 目标优先级决策
+            # 色块检测（受 ROI 保护）
+            purple_blobs = detect_purple_blobs(img, PURPLE_THRESHOLD, roi=smallest_rect)
+            for blob in purple_blobs:
+                img.draw_rectangle(blob[0:4], color=(255, 0, 255), thickness=1)
+                img.draw_cross(blob.cx(), blob.cy(), color=(255, 0, 255), thickness=1)
+
+            # 目标决策
             if smallest_rect and smallest_rect_corners:
                 x_r, y_r, w_r, h_r = smallest_rect
                 corners = smallest_rect_corners
                 sorted_corners = sort_corners(corners)
 
-                # 绘制外框与顶点
                 for i in range(4):
                     x1, y1 = sorted_corners[i]
                     x2, y2 = sorted_corners[(i+1) % 4]
@@ -356,7 +392,6 @@ def main():
                 for p in sorted_corners:
                     img.draw_circle(p[0], p[1], 5, color=(0, 255, 0), thickness=2)
 
-                # 投影矩阵计算
                 virtual_rect = [(0, 0), (RECT_WIDTH, 0), (RECT_WIDTH, RECT_HEIGHT), (0, RECT_HEIGHT)]
                 radius_x = BASE_RADIUS
                 radius_y = BASE_RADIUS
@@ -384,15 +419,17 @@ def main():
 
                         target_x = cx
                         target_y = cy
-                        target_type = "Rectangle"
+                        target_type_id = 1
+                        target_type_str = "Rectangle"
 
             elif purple_blobs:
-                largest_purple = max(purple_blobs, key=lambda b: b.pixels())
+                largest_purple = purple_blobs[0]
                 target_x = largest_purple.cx()
                 target_y = largest_purple.cy()
-                target_type = "Purple Blob"
+                target_type_id = 2
+                target_type_str = "Purple Blob"
 
-            # (4) 闭环速位结合跟踪控制
+            # 闭环控制与数据下发
             if target_x is not None and target_y is not None:
                 raw_x = target_x - CX
                 raw_y = target_y - CY
@@ -402,34 +439,31 @@ def main():
 
                 now = time.ticks_ms()
 
-               # ==========================================
-                # 水平轴 (Yaw) 控制
-                # ==========================================
+                # 云台偏航控制
                 if time.ticks_diff(now, last_pan_control) >= PAN_CONTROL_PERIOD:
                     last_pan_control = now
-
                     if abs(smooth_x) > DEADZONE_X:
                         err_diff_x = smooth_x - last_smooth_x
                         pos_delta = int(KP_PAN * smooth_x + KD_PAN * err_diff_x)
                         last_smooth_x = smooth_x
 
-                        # --- 【新增简单过滤】：忽略低于 6 个脉冲的微小修正，防止电机原地高频震动 ---
+                        v_pan = int(V_MIN_PAN + KV_PAN * abs(smooth_x))
+                        v_pan = max(V_MIN_PAN, min(V_MAX_PAN, v_pan))
+                        last_sent_speed_lr = set_speed_lr(v_pan, last_sent_speed_lr)
+
                         if abs(pos_delta) < 4:
                             pos_delta = 0
 
                         if pos_delta != 0:
                             pan_target += PAN_DIR * pos_delta
                             pan_target = max(PAN_LIMIT_MIN, min(PAN_LIMIT_MAX, pan_target))
-                            move_motor(uart_lr, HORIZONTAL_ADDR, pan_target)
+                            move_motor(HORIZONTAL_ADDR, pan_target)
                     else:
                         last_smooth_x = smooth_x
 
-                # ==========================================
-                # 垂直轴 (Tilt) 控制
-                # ==========================================
+                # 云台俯仰控制
                 if time.ticks_diff(now, last_tilt_control) >= TILT_CONTROL_PERIOD:
                     last_tilt_control = now
-
                     if abs(smooth_y) > DEADZONE_Y:
                         err_diff_y = smooth_y - last_smooth_y
                         pos_delta_y = int(KP_TILT * smooth_y + KD_TILT * err_diff_y)
@@ -437,23 +471,26 @@ def main():
 
                         v_tilt = int(V_MIN_TILT + KV_TILT * abs(smooth_y))
                         v_tilt = max(V_MIN_TILT, min(V_MAX_TILT, v_tilt))
-
-                        set_speed_ud(v_tilt)
+                        last_sent_speed_ud = set_speed_ud(v_tilt, last_sent_speed_ud)
 
                         tilt_target += TILT_DIR * pos_delta_y
                         tilt_target = max(TILT_LIMIT_MIN, min(TILT_LIMIT_MAX, tilt_target))
-
-                        move_motor(uart_ud, VERTICAL_ADDR, tilt_target)
+                        move_motor(VERTICAL_ADDR, tilt_target)
                     else:
                         last_smooth_y = smooth_y
 
+                # 🎯 下发坐标给 TI 下位机控制底盘行进
+                send_to_ti(target_type_id, raw_x, raw_y, pan_target, tilt_target)
+
                 img.draw_cross(target_x, target_y, color=(0, 255, 0), size=15, thickness=2)
                 img.draw_line(target_x, target_y, CX, CY, color=(255, 200, 0), thickness=2)
-                img.draw_string_advanced(20, 40, 32, f"Tracking: {target_type}", color=(0, 255, 255))
+                img.draw_string_advanced(20, 40, 32, f"Tracking: {target_type_str}", color=(0, 255, 255))
             else:
                 smooth_x, smooth_y = 0.0, 0.0
                 last_smooth_x, last_smooth_y = 0.0, 0.0
                 img.draw_string_advanced(20, 40, 32, "Searching...", color=(255, 150, 150))
+                # 无目标时发送无目标包
+                send_to_ti(0, 0, 0, pan_target, tilt_target)
 
             img.draw_cross(CX, CY, color=(0, 255, 0), size=25, thickness=3)
             img.draw_circle(CX, CY, 40, color=(0, 255, 0), thickness=2)
@@ -465,30 +502,7 @@ def main():
                               x=round((lcd_width - sensor.width()) / 2),
                               y=round((lcd_height - sensor.height()) / 2))
 
-    except KeyboardInterrupt as e:
-        print("用户主动退出程序: ", e)
-    except BaseException as e:
-        print(f"发生异常崩溃: {e}")
+    except Exception as e:
+        print(f"云台追踪线程中发生致命错误: {e}")
     finally:
-        # 当点击 CanMV 的“停止”按钮或发生不可预知错误时，强制清理底层硬件，释放VB内存
-        print("正在安全释放硬件多媒体及显示资源，请稍候...")
-        if isinstance(sensor, Sensor):
-            try:
-                sensor.stop()
-            except:
-                pass
-        try:
-            Display.deinit()
-        except:
-            pass
-        os.exitpoint(os.EXITPOINT_ENABLE_SLEEP)
-        time.sleep_ms(150)
-        try:
-            MediaManager.deinit()
-        except:
-            pass
-        print("清理完成，系统已恢复安全状态。")
-
-# --------------------------- 11. 执行入口 ---------------------------
-if __name__ == "__main__":
-    main()
+        print("正在安全卸载云台控制...")

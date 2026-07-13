@@ -1,8 +1,8 @@
-# gimbal_track.py (彻底修复未定义函数及闪退版)
+# gimbal_track.py (彻底解决水平电机不转与振荡抖动版本)
 import time, os, sys
 import math
-import cv_lite  # 导入cv_lite扩展模块
-import ulab.numpy as np  # 导入numpy库
+import cv_lite  
+import ulab.numpy as np  
 from media.sensor import *
 from media.display import *
 from media.media import *
@@ -29,18 +29,16 @@ HORIZONTAL_ADDR = 0x02
 PAN_DIR  = -1                  
 TILT_DIR = 1                   
 
-# 全局速度控制缓存
-last_sent_speed_lr = 350      
-last_sent_speed_ud = 350      
-
 # --------------------------- 2. 视觉算法常量 ---------------------------
-canny_thresh1      = 50        
-canny_thresh2      = 150       
-approx_epsilon     = 0.04      
-area_min_ratio     = 0.005     
-max_angle_cos      = 0.3       
-gaussian_blur_size = 3         
+canny_thresh1      = 30        # 降为 30（原50）：允许低对比度下的弱边缘参与闭合
+canny_thresh2      = 90        # 降为 90（原150）：大幅提升弱光、反光环境下的边缘检出率
+approx_epsilon     = 0.04      # 多边形拟合精度保持 0.04
+area_min_ratio     = 0.002     # 降为 0.002（原0.005）：允许检测距离更远、面积更小的靶标
+max_angle_cos      = 0.55      # 🎯 极其关键！升为 0.55（原0.3）：大幅放宽畸变限制。
+                             # 允许角度倾斜高达 33 度左右时的梯形黑框，依然能被强行识别为矩形
+gaussian_blur_size = 3  
 
+       # 滤波保持 3
 MIN_AREA = 100               
 MAX_AREA = 300000             
 MIN_ASPECT_RATIO = 0.3        
@@ -67,18 +65,16 @@ SMOOTH_X = 0.05
 SMOOTH_Y = 0.10
 
 # 位置环 (PD 控制器)
-KP_PAN   = 0.40
-KD_PAN   = 0.20
+KP_PAN   = 0.25               # 降低水平比例，配合静音低速，实现丝滑无惯性振荡
+KD_PAN   = 0.18               
+
 KP_TILT  = 0.55
 KD_TILT  = 0.18
 
 # 速度环 (动态限速)
-KV_PAN     = 1.5              
-V_MIN_PAN  = 120              
-V_MAX_PAN  = 800              
-KV_TILT    = 2.2
 V_MIN_TILT = 120
 V_MAX_TILT = 900
+KV_TILT    = 2.2
 
 # 控制刷新周期
 PAN_CONTROL_PERIOD = 80       
@@ -101,17 +97,11 @@ def fast_mode_init(uart, addr, speed=350, acc=5):
     ]
     send(uart, cmd)
 
-def set_speed_lr(speed):
-    global last_sent_speed_lr
-    if abs(speed - last_sent_speed_lr) >= 20:
-        fast_mode_init(uart_lr, HORIZONTAL_ADDR, speed)
-        last_sent_speed_lr = speed
-
-def set_speed_ud(speed):
-    global last_sent_speed_ud
-    if abs(speed - last_sent_speed_ud) >= 20:
+def set_speed_ud(speed, last_speed):
+    if abs(speed - last_speed) >= 20:
         fast_mode_init(uart_ud, VERTICAL_ADDR, speed)
-        last_sent_speed_ud = speed
+        return speed
+    return last_speed
 
 def move_motor(uart, addr, target):
     if target < 0:
@@ -160,7 +150,6 @@ def is_valid_rect(corners):
     return valid_ratio and valid_area and valid_aspect
 
 def get_perspective_matrix(src_pts, dst_pts):
-    """计算单应性变换（投影矩阵）"""
     A = []
     B = []
     for i in range(4):
@@ -201,7 +190,6 @@ def get_perspective_matrix(src_pts, dst_pts):
     ]
 
 def transform_points(points, matrix):
-    """将虚拟点阵投影变换到图像坐标系中"""
     transformed = []
     for (x, y) in points:
         x_hom = x * matrix[0][0] + y * matrix[0][1] + matrix[0][2]
@@ -222,8 +210,14 @@ def sort_corners(corners):
 
 # --------------------------- 7. 模块化追踪入口主函数 ---------------------------
 def run_gimbal_tracking(sensor, tp, key_esc, thresholds, width=800, height=480):
-    global last_sent_speed_lr, last_sent_speed_ud
     
+    # 🎯 核心修复：重新绑定物理引脚，防止在 main.py 中被其他串口复用覆盖
+    fpioa = FPIOA()
+    fpioa.set_function(3, FPIOA.UART1_TXD) 
+    fpioa.set_function(4, FPIOA.UART1_RXD)
+    fpioa.set_function(5, FPIOA.UART2_TXD) 
+    fpioa.set_function(6, FPIOA.UART2_RXD)
+
     # 消除“粘滞/重叠触摸”引起的瞬间闪退退出
     print("正在等待触摸释放...")
     while True:
@@ -254,13 +248,17 @@ def run_gimbal_tracking(sensor, tp, key_esc, thresholds, width=800, height=480):
     pan_target = 0
     tilt_target = 0
 
-    last_sent_speed_lr = 350      
+    # 垂直下发速度缓存（水平轴不再动态下发）
     last_sent_speed_ud = 350      
 
     # ------------------ 9. 云台通电归零与就位 ------------------
     print("正在加载绝对位置驱动配置...")
+    
+    # 🎯 核心修复：水平偏航轴通电时一次性将限速锁死在 180 脉冲/秒
+    # 彻底杜绝水平控制逻辑在运动中反复发送 0xF1 导致的串口冲突。且 180 的低速运动能完美抑制惯性超调！
+    fast_mode_init(uart_lr, HORIZONTAL_ADDR, 180) 
+    
     fast_mode_init(uart_ud, VERTICAL_ADDR, 350)
-    fast_mode_init(uart_lr, HORIZONTAL_ADDR, 350)
     time.sleep_ms(200)
 
     # 俯仰回归零点
@@ -421,6 +419,8 @@ def run_gimbal_tracking(sensor, tp, key_esc, thresholds, width=800, height=480):
                             pos_delta = 0
 
                         if pos_delta != 0:
+                            # 🎯 核心改变：水平轴不再动态频繁下发 0xF1 速度指令，避开串口缓冲区冲突！
+                            # 仅保留纯位置 0xFC 指令下发，靠开机已经固化好的安全低速（180）保障云台稳定、不抽动。
                             pan_target += PAN_DIR * pos_delta
                             pan_target = max(PAN_LIMIT_MIN, min(PAN_LIMIT_MAX, pan_target))
                             move_motor(uart_lr, HORIZONTAL_ADDR, pan_target)
@@ -441,7 +441,8 @@ def run_gimbal_tracking(sensor, tp, key_esc, thresholds, width=800, height=480):
                         v_tilt = int(V_MIN_TILT + KV_TILT * abs(smooth_y))
                         v_tilt = max(V_MIN_TILT, min(V_MAX_TILT, v_tilt))
 
-                        set_speed_ud(v_tilt)
+                        # 实时更新垂直速度环
+                        last_sent_speed_ud = set_speed_ud(v_tilt, last_sent_speed_ud)
 
                         tilt_target += TILT_DIR * pos_delta_y
                         tilt_target = max(TILT_LIMIT_MIN, min(TILT_LIMIT_MAX, tilt_target))
