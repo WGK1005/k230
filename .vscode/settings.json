@@ -57,5 +57,12 @@
   "C_Cpp_Runner.useLinkTimeOptimization": false,
   "C_Cpp_Runner.msvcSecureNoWarnings": false,
   "python-envs.defaultEnvManager": "ms-python.python:conda",
-  "python-envs.defaultPackageManager": "ms-python.python:conda"
+  "python-envs.defaultPackageManager": "ms-python.python:conda",
+  "python.analysis.extraPaths": [
+    "C:\\Users\\WGK\\.kendryte\\k230_canmv_stubs\\8f620e570e90363678bd2fb9fdb22f4e16ba8fbf"
+  ],
+  "python.analysis.stubPath": "C:\\Users\\WGK\\.kendryte\\k230_canmv_pylance\\c953a6fc20119f64\\typings",
+  "python.analysis.diagnosticSeverityOverrides": {
+    "reportMissingModuleSource": "none"
+  }
 }

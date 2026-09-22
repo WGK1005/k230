@@ -39,7 +39,6 @@ PULSE_PER_REV = 3200
 
 # 90°
 INIT_TILT = PULSE_PER_REV // 4      # 800
-
 # 垂直运动范围（180°）
 TILT_MIN = 0
 TILT_MAX = PULSE_PER_REV // 2       # 1600
