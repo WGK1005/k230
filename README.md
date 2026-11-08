@@ -1,234 +1,99 @@
-# K230 红色物体跟踪系统 - 配置与使用指南
+# 立创·庐山派 K230 双轴云台视觉追踪与控制工程库
 
-## 系统概述
+[![License](https://img.shields.io/badge/License-MIT-blue.svg)](#)
+[![Platform](https://img.shields.io/badge/Platform-Kendryte%20K230%20CanMV-green.svg)](https://developer.canaan-creative.com/)
+[![Language](https://img.shields.io/badge/Language-MicroPython%20%7C%20C-orange.svg)](#)
 
-这是一个基于K230（庐山派）的完整视觉跟踪系统，包含三个主要部分：
-
-```
-┌─────────────────────────────────────────────────────────┐
-│  K230 (上位机) - change1.py                             │
-│  ├─ 红色物体识别 (color blob detection)                │
-│  ├─ PID控制云台 (2个MG966R舵机)                        │
-│  └─ 串口发送坐标给下位机                                │
-└─────────────┬───────────────────────────────────────────┘
-              │ UART2 (115200 bps)
-              ▼
-┌─────────────────────────────────────────────────────────┐
-│  MCU (下位机) - wheel_controller.py                     │
-│  ├─ 接收目标坐标                                         │
-│  ├─ 计算轮子速度                                         │
-│  └─ 控制电机运动                                         │
-└─────────────────────────────────────────────────────────┘
-```
-
-## 硬件连接
-
-### 1. 舵机接线 (云台控制)
-
-| 功能 | 引脚 | PWM | 信号线 |
-|------|------|-----|--------|
-| 水平舵机 (左右) | Pin46 | PWM2 | 50Hz, 500-2500us |
-| 垂直舵机 (上下) | Pin47 | PWM3 | 50Hz, 500-2500us |
-
-**MG966R舵机脉宽映射：**
-- 500us (0%): 0° (左)
-- 1500us (7.5%): 90° (中点)
-- 2500us (12.5%): 180° (右)
-
-### 2. 串口连接
-
-| 接口 | 用途 | 波特率 | 引脚 |
-|------|------|--------|------|
-| UART2 | K230↔下位机 | 115200 | RX=Pin12, TX=Pin11 |
-
-## 软件配置
-
-### K230上位机 (change1.py)
-
-#### 参数调优
-
-```python
-# 红色阈值 (LAB颜色空间)
-RED_THRESHOLD = (20, 80, 30, 100, 0, 60)
-#              L_MIN, L_MAX, A_MIN, A_MAX, B_MIN, B_MAX
-
-# PID参数 (根据舵机响应速度调整)
-pid_h = SimplePID(kp=0.5, ki=0.05, kd=0.2, max_out=180)
-pid_v = SimplePID(kp=0.5, ki=0.05, kd=0.2, max_out=180)
-
-# 控制死区 (像素)
-DEAD_ZONE_X = 30  # 水平死区
-DEAD_ZONE_Y = 30  # 垂直死区
-
-# 最小色块大小 (像素数)
-MIN_BLOB_PIXELS = 200
-
-# 目标丢失超时 (帧数)
-LOST_TARGET_FRAMES = 15  # 相当于750ms (50ms/帧)
-```
-
-#### 调色工具
-
-运行`color_calibrator.py`来找最佳的红色阈值：
-
-```python
-# 在摄像头下展示红色物体，按ESC键获取LAB值
-python color_calibrator.py
-```
-
-### MCU下位机 (wheel_controller.py)
-
-#### 命令格式
-
-**从K230接收的命令：**
-
-```
-$TARGET,x,y,valid\n
-  x: 目标X坐标 (0-480)
-  y: 目标Y坐标 (0-800)
-  valid: 1=目标有效, 0=目标丢失
-
-$SERVO,pan,tilt\n
-  pan: 水平角度 (-180到180)
-  tilt: 垂直角度 (-180到180)
-```
-
-#### 电机控制实现
-
-修改`control_motors()`函数以适配您的电机驱动：
-
-```python
-def control_motors(self, left_speed, right_speed):
-    """控制电机"""
-    # 示例：使用PWM控制
-    # left_motor.set_speed(left_speed)
-    # right_motor.set_speed(right_speed)
-    pass
-```
-
-## 调试步骤
-
-### 1. 测试舵机
-
-```python
-# 在REPL中测试
-from change1 import servo
-
-servo.set_position(0, 0)      # 两个舵机回中
-time.sleep(1)
-servo.set_position(45, 45)    # 右上
-time.sleep(1)
-servo.set_position(-45, -45)  # 左下
-```
-
-### 2. 测试色块检测
-
-```python
-# 调整RED_THRESHOLD值，观察检测效果
-# 在屏幕上看是否正确识别红色物体
-# 使用色块检测校准工具
-```
-
-### 3. 测试PID控制
-
-```python
-# 调整PID参数，观察舵机跟踪响应
-# Kp: 增大=更快响应但可能震荡
-# Ki: 增大=消除稳态误差但响应变慢
-# Kd: 增大=减少震荡但对噪声敏感
-```
-
-### 4. 测试串口通信
-
-```python
-# 在下位机REPL中运行
-from wheel_controller import WheelController
-
-ctrl = WheelController()
-cmd = ctrl.read_command()
-print(cmd)  # 应该收到来自K230的命令
-```
-
-## 常见问题
-
-### Q: 舵机不动作
-**A:** 
-1. 检查PWM引脚和FPIOA配置
-2. 测试PWM输出：`pwm_h.duty_ns(1500000)` 应该让舵机到中点
-3. 检查舵机电源（需要独立电源，不能从K230供电）
-
-### Q: 色块检测不准确
-**A:**
-1. 调整`RED_THRESHOLD`阈值
-2. 增加光照
-3. 运行`color_calibrator.py`获取准确的LAB值
-
-### Q: 舵机响应过慢/过快
-**A:**
-1. 增加Kp以加快响应
-2. 增加Kd以减少超调
-3. 调整死区大小
-
-### Q: 串口通信无法工作
-**A:**
-1. 确认波特率一致(115200)
-2. 检查UART2引脚(RX=12, TX=11)
-3. 使用示波器验证信号
-
-## 性能指标
-
-| 指标 | 数值 |
-|------|------|
-| 帧率 | 20 Hz |
-| 舵机响应时间 | ~100ms |
-| 精度 | ±2° |
-| 通信延迟 | <10ms |
-
-## 进阶功能
-
-### 1. 添加图像处理滤波
-
-```python
-# 在find_blobs前添加
-img = img.median(1)  # 中值滤波
-img = img.gaussian(1)  # 高斯模糊
-```
-
-### 2. 多物体追踪
-
-```python
-if blobs:
-    # 不仅选择最大的，还可以追踪多个物体
-    for blob in blobs:
-        # 处理多个物体
-        pass
-```
-
-### 3. 添加反馈控制
-
-```python
-# 舵机位置可以通过外部传感器反馈
-# 改进为闭环控制系统
-```
-
-## 文件结构
-
-```
-k230/code/
-├── change1.py              # 主程序 (K230上位机)
-├── wheel_controller.py     # 下位机轮子控制
-├── config.py              # 配置文件 (可选)
-├── README.md              # 本文件
-└── color_calibrator.py    # 颜色校准工具 (可选)
-```
-
-## 参考资源
-
-- K230 官方文档: https://www.lckfb.com
-- MicroPython docs: https://docs.micropython.org
-- MG966R 舵机规格: 500-2500us PWM
+本项目基于**嘉楠 Kendryte K230（玄铁双核 64 位 RISC-V）**与**立创·庐山派 K230-CanMV** 开发板，包含完整的机器视觉识别、二维云台目标闭环追踪、串口总线通信及下位机（STM32/底盘电机）联动系统。已在电赛与机器人视觉场景中实测验证。
 
 ---
 
-最后更新: 2025年1月
-维护者: AI Assistant
+## 📁 仓库目录导航
+
+```text
+k230/
+├── docs/                       # 核心技术文档与知识库
+│   ├── 玩转庐山派K230_入门与双轴云台实战教程.md  # 详细实战长文教程
+│   ├── K230入门指南_飞书文档框架模板.md          # 专为飞书云文档打造的框架模板
+│   ├── images/
+│   │   └── lushan_k230_pinout.jpg                # 官方 40-Pin 引脚高清定义图
+│   └── *.md                                      # 系统说明与快速上手手册
+│
+├── servo_gimbal/               # 方案一：PWM 舵机二维云台 (MG996R)
+│   ├── main_servo_track.py     # 舵机视觉闭环追踪主程序 (原 change1.py)
+│   ├── servo_basic.py          # 舵机基础控制与角度测试
+│   ├── pid.py                  # 位置式/增量式 PID 控制器与抗饱和算法
+│   ├── config.py               # 视觉阈值、舵机限位与 PID 参数配置
+│   └── debug/                  # 舵机串口与端口测试脚本
+│
+├── stepper_gimbal/             # 方案二：高精度闭环步进电机云台 (ZDT X42S)
+│   ├── main_stepper_track.py   # 闭环步进电机视觉追踪主程序 (原 ZDTred.py)
+│   ├── stepper_track_abs.py    # 绝对位置脉冲追踪脚本 (原 步进电机test1.py)
+│   ├── zdt_driver.py           # ZDT X42S 底层驱动指令集 (0xF1, 0xFC, 0x06)
+│   ├── dual_motor_test.py      # 双电机寻址与角度旋转测试 (原 双电机.py)
+│   └── motor_utils.py          # 步进电机通用工具
+│
+├── mcu_comm/                   # 下位机通信模块 (STM32/移动底盘联动)
+│   ├── wheel_controller.py     # 下位机 Python 端模拟与控制
+│   ├── wheel_controller.c      # 下位机 C 语言接收状态机驱动
+│   ├── wheel_controller.h      # 通信协议头文件 ($TARGET 协议)
+│   └── check_uart.py           # 串口透传测试工具
+│
+├── vision_tools/               # 机器视觉与交互工具
+│   ├── color_calibrator.py     # 离线/在线颜色 LAB 阈值标定工具
+│   ├── debug_tool.py           # 实时参数调试工具
+│   ├── ui_core.py              # 触摸屏 UI 交互核心
+│   └── pc_detector.py          # PC 端辅助检测脚本
+│
+├── network/                    # 网络通信与 Wi-Fi 调试
+│   └── WIFI.py                 # K230 板载无线网络连接
+│
+└── archive/                    # 历史旧版本与过渡测试脚本归档（保留历史）
+    ├── tests/                  # 单项测试脚本 (test1~3, task1~4 等)
+    └── legacy/                 # 历史过渡版本 (change2~5, finish, success 等)
+```
+
+---
+
+## 🔌 硬件引脚定义与接线规范
+
+> 📌 **立创·庐山派 K230 引脚定义说明图**
+
+![K230引脚定义](docs/images/lushan_k230_pinout.jpg)
+
+### ⚠️ 关键提示：物理排针号 $\neq$ 内部 GPIO 编号！
+编写 MicroPython `FPIOA().set_function(gpio, func)` 时，**传入的第一个参数永远是内部 GPIO 编号**，切勿误填物理排针号：
+
+| 外设功能 | 物理排针 Pin | 内部 GPIO 编号 | 代码映射配置 | 备注 |
+| :--- | :---: | :---: | :--- | :--- |
+| **水平舵机 (Pan)** | **Pin 32** | **GPIO 46** | `fpioa.set_function(46, FPIOA.PWM2)` | 50Hz, 500~2500μs |
+| **垂直舵机 (Tilt)** | **Pin 12** | **GPIO 47** | `fpioa.set_function(47, FPIOA.PWM3)` | 50Hz, 500~2500μs |
+| **步进垂直轴 (Pitch)** | **Pin 8 / 10** | **GPIO 03 / 04** | `fpioa.set_function(3, FPIOA.UART1_TXD)`<br>`fpioa.set_function(4, FPIOA.UART1_RXD)` | UART1, 地址 0x01 |
+| **步进水平轴 (Yaw)** | **Pin 11 / 13** | **GPIO 05 / 06** | `fpioa.set_function(5, FPIOA.UART2_TXD)`<br>`fpioa.set_function(6, FPIOA.UART2_RXD)` | UART2, 地址 0x02 |
+| **下位机通信串口** | **Pin 11 / 13** | **GPIO 05 / 06** | `fpioa.set_function(5, FPIOA.UART2_TXD)`<br>`fpioa.set_function(6, FPIOA.UART2_RXD)` | 115200 波特率透传 |
+
+---
+
+## ⚡ 快速上手指引
+
+### 1. 运行 PWM 舵机二维云台追踪
+1. 确保舵机由独立的 **5V/6V 3A DC-DC 降压模块** 供电，并与 K230 **单点共地 (GND)**；
+2. 运行舵机追踪主程序：
+   ```bash
+   python servo_gimbal/main_servo_track.py
+   ```
+3. 系统将驱动水平与垂直舵机进行闭环 PID 目标追踪，并在屏幕上绘制十字准星。目标丢失超过 2 秒将自动回中。
+
+### 2. 运行 ZDT X42S 闭环步进电机云台追踪
+1. 确保两只 ZDT X42S 闭环步进电机分别配置为地址 `0x01`（垂直）和 `0x02`（水平），波特率为 115200；
+2. 运行步进云台主程序：
+   ```bash
+   python stepper_gimbal/main_stepper_track.py
+   ```
+3. 系统将以 3200 脉冲/圈高精度自适应追踪目标，具备软件限位防缠绕保护。
+
+---
+
+## 📖 详细文档
+- 📘 [玩转庐山派K230：入门与双轴云台实战教程](docs/玩转庐山派K230_入门与双轴云台实战教程.md)：近万字全流程入门指南，涵盖芯片架构、PID数学推导、步进协议详解与避坑指南。
+- 📑 [飞书文档框架模板](docs/K230入门指南_飞书文档框架模板.md)：专为迁移到飞书云文档知识库打造的结构骨架。

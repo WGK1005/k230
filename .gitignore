@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Large files & Binaries
+*.img
+*.zip
+*.tar.gz
+*.bin
+*.exe
+*.dll
+
+# OS
+.DS_Store
+Thumbs.db
